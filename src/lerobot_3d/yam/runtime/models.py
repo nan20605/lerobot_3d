@@ -14,7 +14,7 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 
-from .geometry import pose, quaternion, rs_depth_to_color, transform
+from .geometry import camera_matrix, pose, quaternion, rs_depth_to_color, transform
 
 I2RT_REV = "120c3c81400171174604e503943f8d1ebc891058"
 LEROBOT_REV = "6b8d8582f60d3ce0d3297c320b0893d867cfc310"
@@ -67,16 +67,12 @@ def initial_config(vendor, capture_metadata=None):
                 "depth_intrinsics": meta["depth"]["intrinsics"],
                 "depth_scale_m_per_unit": meta["depth"]["depth_scale_m_per_unit"],
                 "depth_to_color": meta["depth_to_color"],
-                "source": capture_metadata["capture"],
+                "source": capture_metadata.get(
+                    "capture", capture_metadata.get("observation_id", "provided camera metadata")
+                ),
             }
-    cameras.setdefault(
-        "top_camera",
-        {
-            "model": None,
-            "serial": None,
-            "intrinsics_status": "unknown",
-        },
-    )
+    for name in ("left_camera", "right_camera", "top_camera"):
+        cameras.setdefault(name, {"model": None, "serial": None, "intrinsics_status": "unknown"})
     return {
         "schema_version": 1,
         "convention": "T_parent_child maps child into parent; metres, radians, wxyz",
@@ -119,18 +115,25 @@ def build(vendor, config_path, output, require_calibrated=False):
         if entry["parent"] != parent:
             raise ValueError(f"{name} must be relative to {parent}")
         transform(entry["T_parent_child"])
+    if set(cfg["transforms"]) != set(expected):
+        raise ValueError("Rig must define exactly the two bases and three camera mounts")
     blockers = [
         f"{k}: {v['status']}"
         for k, v in cfg["transforms"].items()
-        if v["status"] not in ("validated", "frame_definition")
+        if v["status"] != "validated" and not (k == "left_base" and v["status"] == "frame_definition")
     ]
     blockers += [
         f"{k}: intrinsics {v['intrinsics_status']}"
         for k, v in cfg["cameras"].items()
         if v["intrinsics_status"] != "validated"
     ]
+    for name in ("left_camera", "right_camera", "top_camera"):
+        if name not in cfg["cameras"] or "intrinsics" not in cfg["cameras"][name]:
+            blockers.append(f"{name}: missing camera intrinsics")
     if cfg["hardware_variant_status"] != "confirmed":
         blockers.append("installed arm/gripper/mount variants unconfirmed")
+    if cfg.get("calibration_source_mode", "live") != "live":
+        blockers.append("calibration data are synthetic, not physical measurements")
     if require_calibrated and blockers:
         raise ValueError("Calibrated export refused: " + "; ".join(blockers))
     output.mkdir(parents=True, exist_ok=True)
@@ -139,6 +142,7 @@ def build(vendor, config_path, output, require_calibrated=False):
     urdf = ET.parse(str(station) + ".urdf").getroot()
     mj = ET.parse(str(station) + ".xml").getroot()
     provenance = {}
+    collision_provenance = {}
 
     def mesh_path(filename):
         source = (station.parent / filename).resolve()
@@ -152,6 +156,37 @@ def build(vendor, config_path, output, require_calibrated=False):
         mesh.set("filename", mesh_path(mesh.attrib["filename"]))
     for mesh in mj.findall("asset/mesh"):
         mesh.set("file", mesh_path(mesh.attrib["file"]))
+    # Upstream URDFs have visual meshes but no collision elements. Export the
+    # same per-link convex hull baseline used by MuJoCo's mesh collision engine.
+    # A hull is not a measured contact model or a convex decomposition.
+    import trimesh
+
+    (output / "collisions").mkdir(exist_ok=True)
+    hull_paths = {}
+    for link in urdf.findall("link"):
+        for visual in link.findall("visual"):
+            geometry = visual.find("geometry")
+            source_mesh = geometry.find("mesh")
+            if source_mesh is None:
+                continue
+            original = source_mesh.get("filename")
+            if original not in hull_paths:
+                hull = trimesh.load_mesh(output / original).convex_hull
+                payload = hull.export(file_type="stl")
+                digest = hashlib.sha256(payload).hexdigest()
+                filename = f"collisions/{digest[:12]}_{Path(original).name}"
+                (output / filename).write_bytes(payload)
+                hull_paths[original] = filename
+                collision_provenance[filename] = {
+                    "sha256": digest,
+                    "visual_mesh": original,
+                    "method": "trimesh convex_hull; MuJoCo baseline, not contact calibration",
+                }
+            collision = ET.SubElement(link, "collision")
+            if visual.find("origin") is not None:
+                collision.append(copy.deepcopy(visual.find("origin")))
+            collision.append(copy.deepcopy(geometry))
+            collision.find("geometry/mesh").set("filename", hull_paths[original])
     mj.find("compiler").set("meshdir", ".")
     # Flat world attachment makes independent measured base/overhead poses explicit.
     ET.SubElement(urdf, "link", name="world")
@@ -269,8 +304,12 @@ def build(vendor, config_path, output, require_calibrated=False):
                 ctrlrange=joint.get("range"),
                 forcerange=f"{-effort} {effort}",
             )
+            # Vendor URDF effort=1 placeholders disagree with its MJCF arm cap.
+            # Preserve that cap for arms and label the provisional gripper force.
+            urdf.find(f"joint[@name='{side}_joint{i}']/limit").set("effort", str(effort))
+        urdf.find(f"joint[@name='{side}_joint8']/limit").set("effort", "0")
     visual = ET.SubElement(mj, "visual")
-    ET.SubElement(visual, "global", offwidth="1280", offheight="960")
+    framebuffer = ET.SubElement(visual, "global", offwidth="1280", offheight="960")
     ET.SubElement(visual, "map", znear="0.002", zfar="10")
     ET.SubElement(
         mj.find("worldbody"),
@@ -293,6 +332,11 @@ def build(vendor, config_path, output, require_calibrated=False):
                 )
             )
         for stream, i, optical in streams:
+            camera_matrix(i)
+            if any(not isinstance(i[key], int) or i[key] <= 0 for key in ("width", "height")):
+                raise ValueError("Camera dimensions must be positive integers")
+            framebuffer.set("offwidth", str(max(int(framebuffer.get("offwidth")), i["width"])))
+            framebuffer.set("offheight", str(max(int(framebuffer.get("offheight")), i["height"])))
             renderer_pose = optical @ pose(wxyz=[0, 1, 0, 0])
             ET.SubElement(
                 mj.find(f".//body[@name='{name}']"),
@@ -355,6 +399,31 @@ def build(vendor, config_path, output, require_calibrated=False):
                 single.remove(node)
         single.set("name", f"yam_{side}")
         write_xml(single, output / f"yam_{side}.urdf")
+        # Arm-only descriptions are useful to consumers that supply their own
+        # world/base transforms. Keep every descendant of the chosen arm base.
+        arm_only = copy.deepcopy(single)
+        descendants = {f"{side}_base"}
+        while True:
+            expanded = descendants | {
+                j.find("child").get("link")
+                for j in arm_only.findall("joint")
+                if j.find("parent").get("link") in descendants
+            }
+            if expanded == descendants:
+                break
+            descendants = expanded
+        for node in list(arm_only):
+            if (
+                node.tag == "link"
+                and node.get("name") not in descendants
+                or node.tag == "joint"
+                and (
+                    node.find("parent").get("link") not in descendants
+                    or node.find("child").get("link") not in descendants
+                )
+            ):
+                arm_only.remove(node)
+        write_xml(arm_only, output / f"yam_{side}_base.urdf")
         # Also deliver a description rooted directly in the overhead optical frame.
         overhead = copy.deepcopy(single)
         j = next(j for j in overhead.findall("joint") if j.find("child").get("link") == "top_camera")
@@ -373,12 +442,50 @@ def build(vendor, config_path, output, require_calibrated=False):
         "calibrated": not blockers,
         "calibration_blockers": blockers,
         "meshes": provenance,
+        "collision_meshes": collision_provenance,
+        "source_files": {
+            suffix: {
+                "url": f"https://github.com/i2rt-robotics/i2rt/blob/{revision}/{STATION}.{suffix}",
+                "sha256": hashlib.sha256(Path(str(station) + "." + suffix).read_bytes()).hexdigest(),
+            }
+            for suffix in ("urdf", "xml")
+        },
+        "joint_limits": {
+            j.get("name"): {
+                "type": j.get("type"),
+                **{key: float(value) for key, value in j.find("limit").attrib.items()},
+                "effort_source": "passive mimic"
+                if j.get("name").endswith("joint8")
+                else "provisional linear force"
+                if j.get("name").endswith("joint7")
+                else "vendor MJCF actuatorfrcrange",
+                "velocity_status": "vendor URDF placeholder; not validated hardware speed",
+            }
+            for j in urdf.findall("joint")
+            if j.find("limit") is not None
+        },
         "rendered_cameras": rendered,
         "geometry": "vendor station; actual mounting dimensions unverified",
         "dynamics": "UNVALIDATED: camera unit-density CAD inertias unless overridden; provisional force limits and gripper gains; no motor latency/friction fit",
-        "contacts": "UNVALIDATED: vendor convex mesh hulls, no measured friction or table unless configured; excludes only each base/link1 bearing pair in addition to MuJoCo defaults",
+        "contacts": "UNVALIDATED: per-link convex hulls in both formats, no measured friction or table unless configured; preserves vendor finger exclusions and excludes each base/link1 bearing pair in addition to MuJoCo defaults",
         "rendering": "Ideal rectified pinhole RGB/depth; no measured lighting, noise or rolling shutter",
         "camera_convention": "optical +X right +Y down +Z forward; renderer Rx(pi); principalpixel=((w-1)/2-cx, (h-1)/2-cy), accounting for integer pixel centres",
+    }
+    portable = [
+        output / "yam_bimanual.urdf",
+        *(
+            output / f"yam_{side}{suffix}.urdf"
+            for side in ("left", "right")
+            for suffix in ("", "_base", "_overhead")
+        ),
+        output / "yam_bimanual.xml",
+        output / "rig.json",
+        output / "I2RT_LICENSE",
+        *(output / "meshes" / name for name in provenance),
+        *(output / name for name in collision_provenance),
+    ]
+    manifest["artifact_sha256"] = {
+        str(p.relative_to(output)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(portable)
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest

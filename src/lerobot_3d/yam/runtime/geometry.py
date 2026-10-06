@@ -38,7 +38,9 @@ def quaternion(t):
 
 def apply(t, points):
     t = transform(t)
-    return np.asarray(points) @ t[:3, :3].T + t[:3, 3]
+    # Explicit contraction avoids BLAS floating-point status warnings after an
+    # OpenGL render on macOS, for this small three-column operation.
+    return np.einsum("...j,ij->...i", np.asarray(points), t[:3, :3]) + t[:3, 3]
 
 
 def rs_depth_to_color(metadata):

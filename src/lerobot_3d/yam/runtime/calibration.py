@@ -101,6 +101,8 @@ def board_spec(squares_x=7, squares_y=5, square_m=0.034, marker_m=0.025):
         "marker_m": marker_m,
         "dictionary": "DICT_5X5_100",
         "units": "metres",
+        "measurement_status": "unmeasured",
+        "measurement_source": None,
         "print_instruction": "Print at measured physical size, no fit-to-page. Measure squares with calipers.",
     }
 

@@ -209,3 +209,29 @@ def test_motor_initialization_requires_ack_before_driver_import():
 
     with pytest.raises(ValueError, match="may calibrate/move grippers"):
         LiveProvider({}, channels={"left": "can_left"})
+
+
+def test_stationary_capture_checks_motion_over_a_window(tmp_path):
+    class PairedClient:
+        def __init__(self, drifting=False):
+            self.index = 0
+            self.drifting = drifting
+
+        def observation(self):
+            self.index += 1
+            now = time.monotonic()
+            meta = observation(now)
+            meta["observation_id"] = str(self.index)
+            meta["arms"]["right"] = dict(meta["arms"]["left"])
+            if self.drifting:
+                meta["arms"]["left"]["position_rad"][0] = self.index * 0.001
+            meta["cameras"] = {"left": {"host_monotonic_s": now, "color": {"frame_number": self.index}}}
+            return meta, {"left_rgb": np.zeros((4, 5, 3), np.uint8)}
+
+    result = save_capture(PairedClient(), tmp_path / "static", require_joints=True, stationary_seconds=0.25)
+    assert result["stationarity"]["sample_count"] >= 3
+    with pytest.raises(ValueError, match="positions changed"):
+        save_capture(
+            PairedClient(drifting=True), tmp_path / "moving", require_joints=True, stationary_seconds=0.25
+        )
+    assert not (tmp_path / "moving").exists()

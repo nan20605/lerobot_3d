@@ -357,21 +357,65 @@ class ReplayProvider:
         pass
 
 
-def save_capture(client, directory, require_joints=False, max_skew_ms=50):
+def check_static_observation(meta, max_skew_ms):
+    if meta["mode"] != "live" or set(meta["arms"]) != {"left", "right"} or not meta["cameras"]:
+        raise ValueError("Paired calibration capture requires LIVE state from both arms and cameras")
+    times = [v["host_monotonic_s"] for v in meta["arms"].values()]
+    for state in meta["arms"].values():
+        q, v = np.asarray(state["position_rad"]), np.asarray(state["velocity_rad_s"])
+        if q.shape != (6,) or v.shape != (6,) or not np.isfinite(np.r_[q, v, state["gripper_open"]]).all():
+            raise ValueError("Invalid feedback in calibration capture")
+        if np.max(abs(v)) > 0.01:
+            raise ValueError("Stop both arms for a static calibration capture")
+    for camera in meta["cameras"].values():
+        if "host_monotonic_s" not in camera:
+            raise ValueError("Camera host timing unavailable")
+        times.append(camera["host_monotonic_s"])
+    if not np.isfinite(times).all() or (max(times) - min(times)) * 1000 > max_skew_ms:
+        raise ValueError("Host arrival skew exceeds capture limit; this is not hardware synchronization")
+
+
+def save_capture(client, directory, require_joints=False, max_skew_ms=50, stationary_seconds=0.75):
+    if not np.isfinite(max_skew_ms) or max_skew_ms <= 0:
+        raise ValueError("Skew limit must be positive and finite")
+    if require_joints and (not np.isfinite(stationary_seconds) or stationary_seconds < 0.25):
+        raise ValueError("Stationarity window must be at least 0.25 seconds")
     meta, arrays = client.observation()
     if require_joints:
-        if meta["mode"] != "live" or set(meta["arms"]) != {"left", "right"}:
-            raise ValueError("Paired calibration capture requires LIVE state from both arms")
-        times = [v["host_monotonic_s"] for v in meta["arms"].values()]
-        for state in meta["arms"].values():
-            if np.max(abs(np.asarray(state["velocity_rad_s"]))) > 0.01:
-                raise ValueError("Stop both arms for a static calibration capture")
-        for camera in meta["cameras"].values():
-            if "host_monotonic_s" not in camera:
-                raise ValueError("Camera host timing unavailable")
-            times.append(camera["host_monotonic_s"])
-        if not times or (max(times) - min(times)) * 1000 > max_skew_ms:
-            raise ValueError("Host arrival skew exceeds capture limit; this is not hardware synchronization")
+        started = time.monotonic()
+        observations = []
+        seen = set()
+        while True:
+            check_static_observation(meta, max_skew_ms)
+            if meta["observation_id"] not in seen:
+                seen.add(meta["observation_id"])
+                observations.append(copy.deepcopy(meta))
+            span = time.monotonic() - started
+            if span >= stationary_seconds and len(observations) >= 3:
+                break
+            if span > stationary_seconds + 3:
+                raise ValueError("Not enough fresh observations to establish stationarity")
+            time.sleep(0.03)
+            meta, arrays = client.observation()
+        maximum_q = maximum_g = 0.0
+        for side in ("left", "right"):
+            maximum_q = max(
+                maximum_q,
+                float(np.max(np.ptp([m["arms"][side]["position_rad"] for m in observations], axis=0))),
+            )
+            maximum_g = max(maximum_g, float(np.ptp([m["arms"][side]["gripper_open"] for m in observations])))
+        if maximum_q > 0.003 or maximum_g > 0.005:
+            raise ValueError("Arm/gripper positions changed during the stationarity window")
+        for name in meta["cameras"]:
+            if len({m["cameras"][name]["color"].get("frame_number") for m in observations}) < 2:
+                raise ValueError(f"Camera {name} did not deliver new frames during the stationary capture")
+        meta["stationarity"] = {
+            "duration_client_s": span,
+            "sample_count": len(observations),
+            "max_joint_span_rad": maximum_q,
+            "max_gripper_span": maximum_g,
+            "scope": "Sampled feedback history, not continuous tracking or exposure synchronization",
+        }
     p = Path(directory)
     p.mkdir(parents=True, exist_ok=False)
     meta["client_received_unix_ns"] = time.time_ns()

@@ -83,10 +83,11 @@ def render_model(directory, output, camera=None):
     options = mujoco.MjvOption()
     options.sitegroup[:] = 0
     paths = []
-    with mujoco.Renderer(m, height=480, width=640) as renderer:
-        for name, view in [("station_nominal", c)] + [(m.camera(i).name, i) for i in range(m.ncam)]:
-            if camera and name != camera:
-                continue
+    for name, view in [("station_nominal", c)] + [(m.camera(i).name, i) for i in range(m.ncam)]:
+        if camera and name != camera:
+            continue
+        width, height = (640, 480) if name == "station_nominal" else m.cam_resolution[view]
+        with mujoco.Renderer(m, height=int(height), width=int(width)) as renderer:
             renderer.disable_depth_rendering()
             renderer.update_scene(d, camera=view, scene_option=options)
             path = output / f"{name}.png"
@@ -96,6 +97,75 @@ def render_model(directory, output, camera=None):
             renderer.update_scene(d, camera=view, scene_option=options)
             np.save(output / f"{name}_depth_m.npy", renderer.render())
     (output / "README.txt").write_text(
-        "NOMINAL vendor geometry at synthetic joint positions. Not a render matched to a physical capture. Depth is ideal optical-axis distance in metres. No calibrated overhead camera is present yet.\n"
+        "Synthetic example joint positions, not a render matched to a physical capture. Depth is ideal optical-axis distance in metres. See rig.json and manifest.json for calibration status. Camera views use their configured resolution.\n"
     )
     return paths
+
+
+def check_numerics(directory, duration=2.0):
+    """Compare the same smooth synthetic trajectory at three integration steps.
+
+    This tests numerical stability/convergence only. It does not identify real
+    gains, latency, friction, camera mass, payload or contact parameters.
+    """
+    import mujoco
+
+    runs = []
+    traces = []
+    for step in (0.002, 0.001, 0.0005):
+        model = mujoco.MjModel.from_xml_path(str((Path(directory) / "yam_bimanual.xml").resolve()))
+        model.opt.timestep = step
+        data = mujoco.MjData(model)
+        q0 = np.array([0, 1.5, 1.5, 0, 0, 0, 0.023475])
+        addresses = []
+        actuators = []
+        for side in ("left", "right"):
+            for i in range(1, 9):
+                data.qpos[model.joint(f"{side}_joint{i}").qposadr[0]] = q0[min(i - 1, 6)]
+            addresses.extend(int(model.joint(f"{side}_joint{i}").qposadr[0]) for i in range(1, 7))
+            actuators.append([model.actuator(f"{side}_position{i}").id for i in range(1, 8)])
+        mujoco.mj_forward(model, data)
+        rows = []
+        penetration = 0.0
+        for index in range(round(duration / step)):
+            target = q0.copy()
+            target[:6] += 0.015 * np.sin(2 * np.pi * data.time / duration)
+            for ids in actuators:
+                data.ctrl[ids] = target
+            mujoco.mj_step(model, data)
+            if not np.isfinite(data.qpos).all() or np.any(data.warning.number):
+                raise ValueError("MuJoCo integration failed during the offline convergence check")
+            if data.ncon:
+                penetration = max(penetration, float(max(0, -np.min(data.contact.dist))))
+            if (index + 1) % round(0.01 / step) == 0:
+                rows.append(data.qpos[addresses].copy())
+        traces.append(np.array(rows))
+        runs.append(
+            {
+                "timestep_s": step,
+                "max_contact_penetration_m": penetration,
+                "warnings": data.warning.number.tolist(),
+                "final_arm_radians": rows[-1].tolist(),
+            }
+        )
+    comparisons = []
+    for index in (0, 1):
+        error = np.abs(traces[index] - traces[-1])
+        comparisons.append(
+            {
+                "timestep_s": runs[index]["timestep_s"],
+                "reference_timestep_s": runs[-1]["timestep_s"],
+                "max_joint_difference_rad": float(error.max()),
+                "rms_joint_difference_rad": float(np.sqrt(np.mean(error**2))),
+            }
+        )
+    return {
+        "scope": "synthetic timestep convergence; NOT hardware fidelity",
+        "duration_s": duration,
+        "sample_period_s": 0.01,
+        "runs": runs,
+        "comparisons": comparisons,
+        "passed": bool(comparisons[0]["max_joint_difference_rad"] < 0.01),
+        "criterion": "less than 0.01 rad versus 0.5 ms reference on this one synthetic trajectory",
+        "physical_validation": False,
+    }

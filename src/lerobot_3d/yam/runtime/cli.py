@@ -35,11 +35,13 @@ def parser():
     b.add_argument("--rig", default="config/rig.nominal.json")
     b.add_argument("--output", default="sim/generated")
     b.add_argument("--require-calibrated", action="store_true")
-    for cmd in ("verify-models", "render"):
+    for cmd in ("verify-models", "render", "audit-models", "export-bundle", "check-numerics"):
         a = s.add_parser(cmd)
         a.add_argument("--models", default="sim/generated")
         if cmd == "render":
             a.add_argument("--output", default="sim/generated/renders")
+        elif cmd in ("audit-models", "export-bundle", "check-numerics"):
+            a.add_argument("--output", required=True)
     b = s.add_parser("serve", help="Loopback only; access remotely with an SSH tunnel")
     mode = b.add_mutually_exclusive_group(required=True)
     mode.add_argument("--replay", metavar="CAPTURE_DIR")
@@ -79,6 +81,7 @@ def parser():
     b.add_argument("--output", required=True)
     b.add_argument("--require-joints", action="store_true")
     b.add_argument("--max-skew-ms", type=float, default=50)
+    b.add_argument("--stationary-seconds", type=float, default=0.75)
     b = s.add_parser(
         "stream-check",
         help="Record client reception statistics without commanding motion",
@@ -103,6 +106,36 @@ def parser():
         b.add_argument("--output", required=True)
         b.add_argument("--max-translation-m", type=float, default=0.01)
         b.add_argument("--max-rotation-deg", type=float, default=1)
+    b = s.add_parser("board-sample", help="Detect a board in a paired capture and attach measured-state FK")
+    b.add_argument("--capture", required=True)
+    b.add_argument("--camera", choices=("left", "right", "overhead"), required=True)
+    b.add_argument("--models", default="sim/generated")
+    b.add_argument("--board", default="calibration/board/board.json")
+    b.add_argument("--split", choices=("train", "validation"), required=True)
+    b.add_argument("--target-id", required=True, help="One fixed physical placement of the board")
+    b.add_argument("--allow-simulation", action="store_true")
+    b.add_argument("--output", required=True)
+    b = s.add_parser(
+        "calibration-set", help="Check sample identity/splits and assemble a calibration dataset"
+    )
+    b.add_argument("--samples", nargs="+", required=True)
+    b.add_argument("--output", required=True)
+    b = s.add_parser(
+        "station-calibrate",
+        help="Two hand-eye fits, relative base pose and overhead fit from one fixed board",
+    )
+    for name in ("left", "right", "overhead"):
+        b.add_argument("--" + name, required=True)
+    b.add_argument("--rig", default="config/rig.nominal.json")
+    b.add_argument("--output", required=True)
+    b.add_argument("--max-translation-m", type=float, default=0.01)
+    b.add_argument("--max-rotation-deg", type=float, default=1)
+    b = s.add_parser("overlay", help="Static real/URDF overlay and registered depth residuals")
+    b.add_argument("--capture", required=True)
+    b.add_argument("--camera", choices=("left", "right", "overhead"), required=True)
+    b.add_argument("--models", default="sim/generated")
+    b.add_argument("--allow-simulation", action="store_true")
+    b.add_argument("--output", required=True)
     for cmd in ("icp", "validate-icp"):
         b = s.add_parser(cmd)
         b.add_argument("--capture", required=True)
@@ -181,6 +214,74 @@ def main(argv=None):
         from .validation import render_model
 
         print(json.dumps(render_model(a.models, a.output), indent=2))
+    elif a.task == "check-numerics":
+        from .validation import check_numerics
+
+        result = check_numerics(a.models)
+        write(a.output, result)
+        print(json.dumps(result, indent=2))
+        if not result["passed"]:
+            raise ValueError("Offline timestep convergence criterion failed; inspect the saved report")
+    elif a.task in ("audit-models", "export-bundle"):
+        from .bundle import audit_bundle, export_bundle
+
+        result = audit_bundle(a.models) if a.task == "audit-models" else export_bundle(a.models, a.output)
+        if a.task == "audit-models":
+            write(a.output, result)
+        print(json.dumps(result, indent=2))
+    elif a.task == "board-sample":
+        from .workflow import board_sample
+
+        write(
+            a.output,
+            board_sample(
+                a.capture,
+                a.camera,
+                a.models,
+                read(a.board),
+                a.split,
+                a.target_id,
+                allow_simulation=a.allow_simulation,
+            ),
+        )
+    elif a.task == "calibration-set":
+        from .workflow import collect_samples
+
+        write(a.output, collect_samples([read(path) for path in a.samples]))
+    elif a.task == "station-calibrate":
+        from .workflow import calibrate_station
+
+        result = calibrate_station(
+            read(a.left),
+            read(a.right),
+            read(a.overhead),
+            read(a.rig),
+            a.max_translation_m,
+            a.max_rotation_deg,
+        )
+        output = Path(a.output)
+        output.mkdir(parents=True, exist_ok=False)
+        write(output / "rig.candidate.json", result.pop("rig"))
+        write(output / "report.json", result)
+        print(
+            json.dumps(
+                {
+                    "output": str(output.resolve()),
+                    "status": result["status"],
+                    "validation_passed": result["validation_passed"],
+                    "source_mode": result["source_mode"],
+                }
+            )
+        )
+    elif a.task == "overlay":
+        from .overlay import overlay_capture
+
+        print(
+            json.dumps(
+                overlay_capture(a.capture, a.camera, a.models, a.output, allow_simulation=a.allow_simulation),
+                indent=2,
+            )
+        )
     elif a.task == "serve":
         from .acquisition import LiveProvider, SimulationProvider
         from .transport import CommandGate, ObservationServer
@@ -230,7 +331,7 @@ def main(argv=None):
 
         run_viewer(a.url, a.models, a.port, a.nominal_preview)
     elif a.task == "capture":
-        meta = save_capture(Client(a.url), a.output, a.require_joints, a.max_skew_ms)
+        meta = save_capture(Client(a.url), a.output, a.require_joints, a.max_skew_ms, a.stationary_seconds)
         print(f"Saved {meta['mode']} capture: {Path(a.output).resolve()}")
     elif a.task == "stream-check":
         client = Client(a.url)
