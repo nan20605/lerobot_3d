@@ -41,6 +41,7 @@ dependencies = [
 
 [project.optional-dependencies]
 realsense = ["pyrealsense2"]
+yam = ["mujoco==3.15.0", "numpy>=1.26,<2.3", "opencv-python==4.12.0.88"]
 orbbec = ["pyorbbecsdk2"]
 segment = ["sam2>=1.1", "torch"]
 test = ["pytest>=7.4", "pytest-cov>=4.1"]
@@ -52,6 +53,7 @@ Issues = "https://github.com/SergioMOrozco/lerobot_3d/issues"
 
 [project.scripts]
 lerobot-teleop = "lerobot_3d.control.teleop:main"
+lerobot-yam = "lerobot_3d.yam.runtime.cli:main"
 
 [tool.setuptools]
 include-package-data = true

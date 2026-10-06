@@ -24,3 +24,12 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+
+# Local YAM vendor checkouts, rig measurements and generated assets
+third_party/
+config/rig*.json
+sim/generated/
+data/raw/
+data/processed/
+calibration/board/
+MUJOCO_LOG.TXT

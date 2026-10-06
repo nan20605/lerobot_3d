@@ -240,3 +240,10 @@ This project builds on [LeRobot](https://github.com/huggingface/lerobot); consid
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, how to run tests/lint, and a roadmap of ideas if you're looking for something to work on.
+
+## YAM integration
+
+An additional `lerobot-yam` entry point supports remote YAM joint feedback,
+RGB-D viewing, measured-state URDF mirroring, camera calibration and nominal
+MuJoCo exports. See [the YAM guide](docs/YAM.md) for setup and the distinction
+between nominal geometry, calibration candidates and validated measurements.

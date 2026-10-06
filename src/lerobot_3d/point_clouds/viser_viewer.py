@@ -178,14 +178,18 @@ class ViserSceneViewer:
         scene_points: np.ndarray,
         scene_colors: np.ndarray | None,
         robots: list[RobotSnapshot],
+        update_scene: bool = True,
     ) -> None:
         """Push one frame: the world-frame scene cloud plus each robot's clouds and pose."""
-        self._scene_handle = self._upsert_point_cloud(
-            self._scene_handle, "/scene_pcd", scene_points, scene_colors
-        )
+        if update_scene:
+            self._scene_handle = self._upsert_point_cloud(
+                self._scene_handle, "/scene_pcd", scene_points, scene_colors
+            )
         for robot in robots:
             i = robot.index
             self._ensure_robot_frame(i, robot.base_offset)
+            self._robot_frames[i].position = np.asarray(robot.base_offset)
+            self._robot_frames[i].wxyz = np.asarray(robot.base_wxyz)
             root = self._robot_root(i)
             robot_points = np.asarray(robot.pcd, dtype=np.float64)
             robot_colors = np.tile(np.array([ROBOT_PCD_COLOR]), (robot_points.shape[0], 1))
